@@ -2,7 +2,7 @@
 
 A short, atmospheric platformer where **your light is your only resource**. Built for the [DEV June Solstice Game Jam](https://dev.to/challenges/june-game-jam-2026-06-03).
 
-**▶ Play:** https://himanshu748.github.io/solstice/
+**▶ Play:** https://hyperagent.com/s/A_Xul17aTbCIAsAcvG8A-w
 
 On the eve of the solstice the sun is failing. Carry the last ember of daylight across four levels — **Dusk → Twilight → Deep Night → The Turning** — and rekindle the dawn. Your light lets you see, slowly drains, and is spent in a **Sunburst** to bloom platforms, light beacons, and push back the dark.
 
