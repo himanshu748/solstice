@@ -1,0 +1,1094 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>SOLSTICE — The Longest Day</title>
+<style>
+  :root { --ink:#05060f; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body {
+    height:100%; background:#05060f; overflow:hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color:#f4ecd8; -webkit-font-smoothing:antialiased; touch-action:none;
+  }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; touch-action:none; background:
+      radial-gradient(120% 120% at 50% 0%, #0b0d1f 0%, #05060f 60%, #020208 100%); }
+  #game {
+    width:min(100vw, 177.78vh); height:min(56.25vw, 100vh); max-width:100vw; max-height:100vh;
+    image-rendering:auto; display:block; box-shadow:0 0 120px rgba(0,0,0,0.8), 0 0 1px rgba(255,255,255,0.06);
+    border-radius:6px; outline:none;
+    /* critical for mobile: stop the browser interpreting multi-touch on the canvas as pan/zoom gestures */
+    touch-action:none; -ms-touch-action:none;
+    -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+  }
+  /* gameplay UI is drawn in-canvas */
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1280" height="720" tabindex="0"></canvas>
+</div><script>
+"use strict";
+(() => {
+/* =========================================================================
+   SOLSTICE — The Longest Day
+   A light-as-resource platformer built for the DEV June Solstice Game Jam.
+   Single-file, vanilla JS + Canvas2D. No dependencies.
+   Light is your only resource: it reveals the world AND is spent to act.
+   ========================================================================= */
+
+let VIEW_W = 1280; const VIEW_H = 720;  // VIEW_W adapts to the device aspect ratio (see fitCanvas)
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+// Offscreen canvas for the lighting pass (darkness + punched holes).
+const lc = document.createElement('canvas'); lc.width = VIEW_W; lc.height = VIEW_H;
+const lctx = lc.getContext('2d');
+
+// Fit the canvas to the ACTUAL visible area (more reliable than CSS vh/vw on mobile,
+// and re-fits on rotate) — keeps the whole 16:9 game on-screen, letterboxed.
+function fitCanvas(){
+  const vw = window.innerWidth, vh = window.innerHeight;
+  // Adapt the game's aspect ratio to the device so landscape fills the screen with no wasted
+  // side bars (it simply reveals a little more of the world). Clamped to a sane range.
+  const aspect = Math.max(1.34, Math.min(2.33, vw/vh));
+  VIEW_W = Math.round(VIEW_H * aspect);
+  if (cv.width !== VIEW_W) cv.width = VIEW_W;   // render buffer (height stays 720)
+  if (lc.width !== VIEW_W) lc.width = VIEW_W;   // lighting buffer matches
+  let w = vw, h = Math.round(vw/aspect);
+  if (h > vh){ h = vh; w = Math.round(vh*aspect); }
+  cv.style.width = w+'px'; cv.style.height = h+'px';
+}
+addEventListener('resize', fitCanvas);
+addEventListener('orientationchange', ()=>{ setTimeout(fitCanvas, 120); setTimeout(fitCanvas, 400); });
+fitCanvas();
+
+/* ----------------------------- tuning ---------------------------------- */
+const GRAV       = 2150;     // px/s^2
+const MOVE_SPEED = 270;      // px/s target horizontal
+const ACCEL      = 2900;     // px/s^2 ground/air accel toward target
+const FRICTION   = 2600;     // px/s^2 decel when no input
+const JUMP_VEL   = 720;      // initial jump impulse
+const JUMP_CUT   = 0.45;     // velocity multiplier when jump released early
+const MAX_FALL   = 1150;
+const COYOTE     = 0.085;    // s grace after leaving ledge
+const BUFFER     = 0.12;     // s jump input buffer
+const LIGHT_MAX  = 100;
+const R_MIN      = 120;      // light radius at 0 light (generous so footing is always visible)
+const R_MAX      = 300;      // light radius at full light
+const PULSE_COST = 16;
+const PULSE_R    = 175;      // sunburst reach
+const PULSE_BLOOM= 2.6;      // s a light-platform stays bloomed after a pulse
+const MOTE_VALUE = 34;
+
+/* ----------------------------- input ----------------------------------- */
+const keys = {};
+const justPressed = {};
+function keyName(e){
+  // normalize EVERYTHING to lowercase so 'ArrowLeft'->'arrowleft', 'Enter'->'enter', 'Shift'->'shift', ' ' stays ' '
+  return e.key.toLowerCase();
+}
+addEventListener('keydown', e => {
+  const k = keyName(e);
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' ','Spacebar'].includes(e.key)) e.preventDefault();
+  if (!keys[k]) justPressed[k] = true;
+  keys[k] = true;
+  ensureAudio();
+  handleMenuKey(k);
+}, {passive:false});
+addEventListener('keyup', e => { keys[keyName(e)] = false; });
+// ---- mouse (desktop): single pointer ----
+const pointer = { down:false, x:0, y:0 };
+function canvasPos(clientX, clientY){ const r=cv.getBoundingClientRect();
+  return { x:(clientX-r.left)*(VIEW_W/r.width), y:(clientY-r.top)*(VIEW_H/r.height) }; }
+function mdown(ev){ ensureAudio(); try{cv.focus();}catch(e){} pointer.down=true; const p=canvasPos(ev.clientX,ev.clientY); pointer.x=p.x; pointer.y=p.y;
+  if (state==='play') applyTouchZones(p); else menuClick(); ev.preventDefault(); }
+function mmove(ev){ const p=canvasPos(ev.clientX,ev.clientY); pointer.x=p.x; pointer.y=p.y; if(pointer.down && state==='play') applyTouchZones(p); }
+function mup(){ pointer.down=false; touch.left=touch.right=touch.jump=touch.pulse=false; }
+cv.addEventListener('mousedown', mdown); cv.addEventListener('mousemove', mmove); addEventListener('mouseup', mup);
+
+// ---- touch (mobile): MULTI-touch so move + jump (+ burst) work at the same time ----
+function buttonAt(x,y){ const b=ctrlButtons(); const hit=r=> x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h;
+  if(hit(b.left))return 'left'; if(hit(b.right))return 'right'; if(hit(b.jump))return 'jump'; if(hit(b.burst))return 'burst'; return null; }
+function updateTouches(ev){
+  const r=cv.getBoundingClientRect(); let L=false,R=false,J=false,B=false;
+  for (let i=0;i<ev.touches.length;i++){ const t=ev.touches[i];
+    const x=(t.clientX-r.left)*(VIEW_W/r.width), y=(t.clientY-r.top)*(VIEW_H/r.height);
+    const btn=buttonAt(x,y);
+    if(btn==='left')L=true; else if(btn==='right')R=true; else if(btn==='jump')J=true; else if(btn==='burst')B=true;
+  }
+  if (J && !touch.jump) touch.jumpEdge=true;   // edge-trigger the jump
+  touch.left=L; touch.right=R; touch.jump=J; touch.pulse=B;
+}
+function tstart(ev){ ensureAudio(); touchMode=true; try{cv.focus();}catch(e){}
+  if (state!=='play') menuClick(); else updateTouches(ev); ev.preventDefault(); }
+function tmove(ev){ if(state==='play') updateTouches(ev); ev.preventDefault(); }
+function tend(ev){ if(state==='play') updateTouches(ev); else { touch.left=touch.right=touch.jump=touch.pulse=false; } ev.preventDefault(); }
+cv.addEventListener('touchstart', tstart, {passive:false});
+cv.addEventListener('touchmove', tmove, {passive:false});
+cv.addEventListener('touchend', tend, {passive:false});
+cv.addEventListener('touchcancel', tend, {passive:false});
+// block iOS Safari pinch-zoom / double-tap-zoom (Android is handled by touch-action:none on the canvas)
+['gesturestart','gesturechange','gestureend'].forEach(t=>document.addEventListener(t, e=>e.preventDefault(), {passive:false}));
+document.addEventListener('dblclick', e=>e.preventDefault(), {passive:false});
+cv.addEventListener('contextmenu', e=>e.preventDefault());
+
+/* on-screen control buttons — shown during play, clickable with mouse OR touch.
+   Hit zones are derived from the same rects we draw, so visible buttons == clickable areas. */
+let touchMode = (typeof navigator!=='undefined') && (('ontouchstart' in window) || (navigator.maxTouchPoints>0) || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches));
+const touch = { left:false, right:false, jump:false, pulse:false, jumpEdge:false };
+function ctrlButtons(){
+  const s = touchMode?104:62, pad = touchMode?30:22, gap = touchMode?20:14;
+  const by = VIEW_H - s - (touchMode?34:24);
+  return {
+    left:  {x:pad,            y:by,        w:s, h:s, label:'◀'},
+    right: {x:pad+s+gap,      y:by,        w:s, h:s, label:'▶'},
+    burst: {x:VIEW_W-pad-s,   y:by-s-gap,  w:s, h:s, label:'BURST'},
+    jump:  {x:VIEW_W-pad-s,   y:by,        w:s, h:s, label:'JUMP'},
+  };
+}
+function applyTouchZones(p){
+  const b=ctrlButtons();
+  const hit=r=> p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h;
+  touch.left = hit(b.left);
+  touch.right = hit(b.right);
+  const j = hit(b.jump); if (j && !touch.jump) touch.jumpEdge=true; touch.jump=j;
+  touch.pulse = hit(b.burst);
+}
+
+/* ----------------------------- audio (soft & soothing) ------------------ */
+let actx = null, master = null, muted = false, ambGain=null, ambNodes=[];
+function ensureAudio(){
+  if (actx) return;
+  try {
+    actx = new (window.AudioContext||window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = muted?0:0.42;
+    // gentle global low-pass so nothing is ever harsh
+    const soft = actx.createBiquadFilter(); soft.type='lowpass'; soft.frequency.value=2600; soft.Q.value=0.2;
+    master.connect(soft); soft.connect(actx.destination);
+    ambGain = actx.createGain(); ambGain.gain.value = 0.0; ambGain.connect(master);
+  } catch(e){ actx = null; }
+}
+function setAmbient(rootHz, mood){
+  if (!actx) return;
+  ambNodes.forEach(n=>{ try{n.stop();}catch(e){} });
+  ambNodes = [];
+  const now = actx.currentTime;
+  const base = rootHz*2; // warmer, audible on phone speakers
+  const filt = actx.createBiquadFilter(); filt.type='lowpass'; filt.frequency.value = mood==='dark'?700:1150; filt.Q.value=0.3;
+  filt.connect(ambGain);
+  // warm, purely consonant sine pad (harmonic-series voices → organ-like, never dissonant)
+  const voices = [{m:1,g:0.16},{m:1.5,g:0.06},{m:2,g:0.10},{m:3,g:0.045},{m:5,g:0.022}];
+  voices.forEach((v,i)=>{
+    const o = actx.createOscillator(); o.type='sine'; o.frequency.value = base*v.m;
+    const g = actx.createGain(); g.gain.value = v.g;
+    // very slow, gentle vibrato so the pad breathes
+    const lfo = actx.createOscillator(); lfo.type='sine'; lfo.frequency.value = 0.05 + i*0.013;
+    const lg = actx.createGain(); lg.gain.value = base*v.m*0.0015;
+    lfo.connect(lg); lg.connect(o.detune); lfo.start(now);
+    o.connect(g); g.connect(filt); o.start(now);
+    ambNodes.push(o, lfo);
+  });
+  ambGain.gain.cancelScheduledValues(now);
+  ambGain.gain.setValueAtTime(ambGain.gain.value, now);
+  ambGain.gain.linearRampToValueAtTime(0.5, now+4); // slow swell in
+}
+function tone(freq, dur, vol=0.1, slideTo=null, type='sine'){
+  if (!actx || muted) return;
+  const now = actx.currentTime;
+  const o = actx.createOscillator(); o.type = type; o.frequency.setValueAtTime(freq, now);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(40,slideTo), now+dur);
+  const g = actx.createGain(); g.gain.setValueAtTime(0.0001, now);
+  g.gain.exponentialRampToValueAtTime(vol, now+Math.min(0.06,dur*0.3)); // soft attack
+  g.gain.exponentialRampToValueAtTime(0.0001, now+dur);                 // gentle release
+  o.connect(g); g.connect(master); o.start(now); o.stop(now+dur+0.03);
+}
+const blip = tone; // alias for any older references
+function softNoise(dur=0.4, vol=0.05, lp=900){
+  if (!actx || muted) return;
+  const now = actx.currentTime;
+  const n = Math.floor(actx.sampleRate*dur);
+  const buf = actx.createBuffer(1, n, actx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i=0;i<n;i++){ const env=Math.sin(Math.PI*i/n); d[i]=(Math.random()*2-1)*env*env; } // smooth swell in/out
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const f = actx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=lp;
+  const g = actx.createGain(); g.gain.value=vol;
+  src.connect(f); f.connect(g); g.connect(master); src.start(now);
+}
+const noiseBurst = softNoise; // alias
+function chord(freqs, dur=1.4, vol=0.07){
+  if(!actx||muted) return; freqs.forEach((f,i)=> setTimeout(()=>tone(f,dur,vol,null,'sine'),i*90));
+}
+const SFX = {
+  jump(){ tone(294, 0.16, 0.05, 392); },                                       // soft gentle rise
+  land(){ tone(150, 0.14, 0.05, 110); },                                       // soft low cushion (hard landings only)
+  collect(){ tone(880,0.5,0.08); setTimeout(()=>tone(1318.5,0.6,0.06),80); },   // gentle two-note chime
+  pulse(){ softNoise(0.55,0.05,1000); tone(196,0.7,0.09,140); },                // soft warm whoosh + swell
+  beacon(){ chord([523.25,659.25,783.99],1.4,0.06); },                         // warm major chord, quiet
+  hurt(){ tone(330,0.4,0.08,150); },                                           // soft descending sigh
+  win(){ chord([523.25,659.25,783.99,1046.5],2.6,0.08); }                      // gentle ascending chord
+};
+
+/* ----------------------------- particles -------------------------------- */
+const parts = [];
+function spawn(x,y,opts){
+  parts.push(Object.assign({ x,y, vx:0,vy:0, life:1, max:1, r:3, col:'#ffd9', grav:0, add:true, fade:true }, opts));
+}
+function burstParticles(x,y,n,base){
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2, sp = (base.spd||120)*(0.4+Math.random()*0.8);
+    spawn(x,y,Object.assign({}, base, { vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:base.life||0.8, max:base.life||0.8, r:(base.r||3)*(0.6+Math.random()*0.8) }));
+  }
+}
+function updateParts(dt){
+  for (let i=parts.length-1;i>=0;i--){
+    const p = parts[i];
+    p.vy += (p.grav||0)*dt; p.x += p.vx*dt; p.y += p.vy*dt; p.life -= dt;
+    if (p.life <= 0) parts.splice(i,1);
+  }
+}
+
+/* ----------------------------- helpers ---------------------------------- */
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+const lerp = (a,b,t)=> a+(b-a)*t;
+function aabb(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+function rectCenter(r){ return { x:r.x+r.w/2, y:r.y+r.h/2 }; }
+function dist2(ax,ay,bx,by){ const dx=ax-bx,dy=ay-by; return dx*dx+dy*dy; }
+
+/* ----------------------------- levels ----------------------------------- */
+// Platform types: 'solid' (always), 'light' (solid only when illuminated),
+// 'move' (solid, oscillates). Hazards: spike rects + umbra zones + void (fall).
+// Each level: palette (sky stops + tint), darkness strength, drain rate.
+function P(x,y,w,h,type='solid',opts={}){ return Object.assign({x,y,w,h,type, lit:false, bloom:0}, opts); }
+
+const LEVELS = [
+  { // 1 — DUSK : learn to move, see, collect
+    name:'I · Dusk', sub:'The sun slips below the hills. Hold what light remains.',
+    sky:['#2a1c46','#5b2f53','#b5562f','#e89d4c'], tint:'rgba(255,150,70,0.05)',
+    dark:0.34, drain:0.8, start:{x:120,y:430}, worldW:3200, bottom:900,
+    plats:[
+      P(40,520,360,200), P(470,520,260,200), P(820,560,220,160),
+      P(1120,500,90,24,'light'), P(1300,470,90,24,'light'),
+      P(1480,520,360,200), P(1980,460,200,260), P(2300,420,220,300),
+      P(2620,360,520,360),
+    ],
+    motes:[ {x:560,y:470,v:MOTE_VALUE}, {x:1210,y:430,v:24}, {x:2060,y:400,v:MOTE_VALUE} ],
+    beacons:[ {x:880,y:520} , {x:2380,y:380} ],
+    spikes:[ ],
+    umbra:[ ],
+    goal:{x:2980,y:240,w:64,h:120},
+    tips:[ {x:160,y:380,t:'Move with  ← →   ·   Jump with  SPACE'},
+           {x:1040,y:380,t:'These pale platforms turn solid only in your light.'},
+           {x:840,y:430,t:'Touch a beacon to bank your progress.'} ]
+  },
+  { // 2 — TWILIGHT : spend light to bloom platforms across gaps
+    name:'II · Twilight', sub:'The world dims. Spend light to make a path — then catch it back.',
+    sky:['#1a1736','#3a2350','#6b2f55','#caa24e'], tint:'rgba(180,120,80,0.06)',
+    dark:0.46, drain:1.3, start:{x:120,y:430}, worldW:3600, bottom:1000,
+    plats:[
+      P(40,520,300,300), P(420,520,160,300),
+      P(700,480,80,24,'light'), P(900,440,80,24,'light'), P(1100,400,80,24,'light'),
+      P(1300,470,200,300),
+      P(1640,470,90,24,'move',{ax:1640,bx:1980,speed:90}),
+      P(2120,440,260,360),
+      P(2480,520,90,24,'light'), P(2660,560,90,24,'light'),
+      P(2840,500,560,400),
+    ],
+    motes:[ {x:480,y:470,v:MOTE_VALUE}, {x:1380,y:420,v:MOTE_VALUE}, {x:2220,y:390,v:MOTE_VALUE}, {x:2980,y:450,v:24} ],
+    beacons:[ {x:1360,y:470}, {x:2200,y:440} ],
+    spikes:[ {x:780,y:980,w:540,h:20} ],
+    umbra:[ ],
+    goal:{x:3260,y:240,w:64,h:120},
+    tips:[ {x:240,y:380,t:'Press  J  for a Sunburst — it blooms nearby light-platforms solid for a few seconds.'},
+           {x:1620,y:380,t:'Some platforms drift. Ride them.'} ]
+  },
+  { // 3 — DEEP NIGHT : darkness drains you; chain beacons, dodge umbra
+    name:'III · Deep Night', sub:'The longest dark. Linger in the void and it drinks your light.',
+    sky:['#070a1c','#0e1430','#241a44','#3a2a4e'], tint:'rgba(60,80,160,0.06)',
+    dark:0.6, drain:2.0, start:{x:120,y:430}, worldW:3900, bottom:1050,
+    plats:[
+      P(40,520,260,320), P(380,520,150,320),
+      P(620,470,90,24,'light'), P(820,470,90,24,'move',{ay:1,by:1,y0:470,y1:300,speed:70,vert:true}),
+      P(1040,440,150,360), P(1260,400,90,24,'light'), P(1460,360,90,24,'light'),
+      P(1660,440,200,360),
+      P(1980,420,90,24,'move',{ax:1980,bx:2280,speed:120}),
+      P(2440,440,200,360), P(2740,400,90,24,'light'), P(2940,360,90,24,'light'),
+      P(3140,460,720,500),
+    ],
+    motes:[ {x:1100,y:400,v:MOTE_VALUE}, {x:1720,y:400,v:MOTE_VALUE}, {x:2500,y:400,v:MOTE_VALUE}, {x:3300,y:410,v:MOTE_VALUE} ],
+    beacons:[ {x:1100,y:440}, {x:1740,y:440}, {x:2520,y:440} ],
+    spikes:[ {x:530,y:1030,w:90,h:20}, {x:2640,y:1030,w:100,h:20} ],
+    umbra:[ {x:1180,y:520,w:280,h:520}, {x:2620,y:520,w:520,h:520} ],
+    goal:{x:3680,y:200,w:64,h:120},
+    tips:[ {x:240,y:380,t:'Shadowed hollows drain you fast. Keep moving and keep your light high.'} ]
+  },
+  { // 4 — THE TURNING : the gauntlet, then dawn
+    name:'IV · The Turning', sub:'Climb to the altar and rekindle the dawn.',
+    sky:['#060912','#101a3a','#3a2a5e','#caa24e'], tint:'rgba(120,90,160,0.05)',
+    dark:0.56, drain:1.9, start:{x:120,y:520}, worldW:3400, bottom:1150,
+    plats:[
+      P(40,600,240,560), P(330,560,120,600),
+      P(540,500,90,24,'light'), P(720,440,90,24,'light'),
+      P(900,520,90,24,'move',{ax:900,bx:1180,speed:120}),
+      P(1320,470,160,690), P(1540,400,90,24,'light'),
+      P(1720,330,90,24,'move',{ay:1,y0:330,y1:170,speed:80,vert:true}),
+      P(1920,260,160,900), P(2140,200,90,24,'light'),
+      P(2320,150,90,24,'light'), P(2520,110,160,1040),
+      P(2760,60,640,1100),
+    ],
+    motes:[ {x:600,y:450,v:30}, {x:1400,y:430,v:MOTE_VALUE}, {x:2000,y:220,v:MOTE_VALUE}, {x:2600,y:80,v:MOTE_VALUE} ],
+    beacons:[ {x:1360,y:470}, {x:1960,y:260}, {x:2560,y:110} ],
+    spikes:[ {x:450,y:1130,w:870,h:20}, {x:1480,y:1130,w:440,h:20} ],
+    umbra:[ {x:1480,y:430,w:440,h:720} ],
+    goal:{x:3140,y:-180,w:80,h:140, altar:true},
+    tips:[ {x:200,y:470,t:'One last climb. Everything you have learned, all at once.'} ]
+  },
+];
+
+/* ----------------------------- game state ------------------------------- */
+let state = 'title';   // title | play | pause | transition | win
+let levelIndex = 0;
+let level = null;
+let player = null;
+let cam = { x:0, y:0, shake:0 };
+let time = 0;          // total elapsed playtime (s)
+let levelTime = 0;
+let transTimer = 0;
+let flash = 0;         // white flash amount (dawn)
+let dawnAmount = 0;    // 0..1 dawn light flood on final level
+let motesCollected = 0, motesTotal = 0;
+let deaths = 0;
+let titleT = 0;
+
+function newPlayer(s){
+  return { x:s.x, y:s.y, w:26, h:34, vx:0, vy:0, onGround:false,
+           light:LIGHT_MAX, coyote:0, buffer:0, face:1, sx:1, sy:1,
+           respawn:{x:s.x,y:s.y}, dead:0, pulseCd:0, walk:0 };
+}
+function loadLevel(i){
+  levelIndex = i; level = LEVELS[i];
+  // reset dynamic platform state
+  level.plats.forEach(p=>{ p.bloom=0; p.lit=false; if(p.type==='move'){ p.t=Math.random()*6; p._x=p.x; p._y=p.y; } });
+  level.motes.forEach(m=> m.taken=false);
+  level.beacons.forEach(b=>{ b.on=false; });
+  player = newPlayer(level.start);
+  motesTotal = level.motes.length;
+  cam.x = player.x - VIEW_W/2; cam.y = player.y - VIEW_H/2; cam.shake=0;
+  levelTime = 0; dawnAmount = 0; flash = 0;
+  if (actx){ setAmbient(level.dark>0.85?44:55, level.dark>0.8?'dark':'warm'); }
+}
+
+/* ----------------------------- update ----------------------------------- */
+function update(dt){
+  titleT += dt;
+  if (state==='title' || state==='win'){
+    if (state==='win'){ flash=Math.max(0,flash-dt*0.8); dawnAmount=Math.min(1,dawnAmount+dt*0.5); cam.shake=Math.max(0,cam.shake-dt*22); }
+    updateParts(dt); return;
+  }
+  if (state==='pause') return;
+  if (state==='transition'){
+    transTimer -= dt;
+    updateParts(dt);
+    if (transTimer<=0){ state='play'; }
+    return;
+  }
+  time += dt; levelTime += dt;
+
+  const pl = player;
+  if (AUTO) autoDrive(dt);
+
+  // ---- input intent
+  let ix = 0;
+  if (keys['arrowleft']||keys['a']||touch.left) ix -= 1;
+  if (keys['arrowright']||keys['d']||touch.right) ix += 1;
+  const jumpHeld = keys[' ']||keys['w']||keys['arrowup']||keys['spacebar']||touch.jump;
+  const jumpEdge = justPressed[' ']||justPressed['w']||justPressed['arrowup']||justPressed['spacebar']||touch.jumpEdge;
+  const pulseEdge = justPressed['j']||justPressed['shift']||justPressed['k']||touch.pulse && !pl._pulseLatch;
+  touch.jumpEdge = false;
+
+  if (pl.dead>0){
+    pl.dead -= dt;
+    updateParts(dt);
+    if (pl.dead<=0){ // respawn
+      pl.x=pl.respawn.x; pl.y=pl.respawn.y; pl.vx=0; pl.vy=0;
+      pl.light = Math.max(pl.light, 45);
+    }
+    cam.shake = Math.max(cam.shake, 0);
+    updateCam(dt);
+    return;
+  }
+
+  // ---- movement
+  const target = ix*MOVE_SPEED*(pl.light<=0?0.62:1);
+  if (ix!==0){ pl.face = ix; pl.vx += clamp(target-pl.vx, -ACCEL*dt, ACCEL*dt); }
+  else { const f=FRICTION*dt; if (pl.vx>0) pl.vx=Math.max(0,pl.vx-f); else pl.vx=Math.min(0,pl.vx+f); }
+
+  // jump buffering + coyote
+  pl.coyote = pl.onGround ? COYOTE : Math.max(0, pl.coyote-dt);
+  if (jumpEdge) pl.buffer = BUFFER; else pl.buffer = Math.max(0, pl.buffer-dt);
+  if (pl.buffer>0 && pl.coyote>0){
+    pl.vy = -JUMP_VEL; pl.onGround=false; pl.coyote=0; pl.buffer=0;
+    pl.sx=0.7; pl.sy=1.3; SFX.jump();
+    burstParticles(pl.x+pl.w/2, pl.y+pl.h, 5, {col:'#ffd9a0', spd:90, life:0.5, r:2, grav:300});
+  }
+  if (!jumpHeld && pl.vy < 0) pl.vy *= 0.86; // variable jump height: cut upward velocity when jump released
+
+  pl.vy += GRAV*dt; if (pl.vy>MAX_FALL) pl.vy=MAX_FALL;
+
+  // ---- light drain
+  pl.light = clamp(pl.light - level.drain*dt, 0, LIGHT_MAX);
+
+  // ---- pulse / sunburst
+  pl.pulseCd = Math.max(0, pl.pulseCd-dt);
+  if (pulseEdge && pl.light>=PULSE_COST && pl.pulseCd<=0){
+    pl.light -= PULSE_COST; pl.pulseCd = 0.35;
+    const cx=pl.x+pl.w/2, cy=pl.y+pl.h/2;
+    cam.shake = Math.max(cam.shake, 7);
+    SFX.pulse();
+    burstParticles(cx,cy,26,{col:'#ffdf9e', spd:260, life:0.6, r:3, add:true});
+    parts.push({x:cx,y:cy,ring:true,r:8,max:0.5,life:0.5,col:'#ffe6a8'});
+    level.plats.forEach(p=>{ if(p.type==='light'){ const c=rectCenter(p); if(dist2(cx,cy,c.x,c.y) < PULSE_R*PULSE_R) p.bloom = PULSE_BLOOM; } });
+    level.beacons.forEach(b=>{ if(dist2(cx,cy,b.x,b.y) < (PULSE_R*1.1)**2) lightBeacon(b); });
+  }
+
+  // ---- moving platforms
+  level.plats.forEach(p=>{
+    if (p.type!=='move') return;
+    p.t = (p.t||0) + dt;
+    if (p.vert){
+      const range=(p.y1-p.y0); p._y = p.y0 + (Math.sin(p.t*(p.speed/100))*0.5+0.5)*range; p.y=p._y;
+    } else {
+      const range=(p.bx-p.ax); p._x = p.ax + (Math.sin(p.t*(p.speed/200))*0.5+0.5)*range; p.x=p._x;
+    }
+  });
+
+  // ---- compute lighting/solidity for light-platforms
+  const lr = lerp(R_MIN,R_MAX, pl.light/LIGHT_MAX);
+  const pcx=pl.x+pl.w/2, pcy=pl.y+pl.h/2;
+  level.plats.forEach(p=>{
+    p.bloom = Math.max(0, (p.bloom||0)-dt);
+    if (p.type==='light'){
+      const c=rectCenter(p);
+      const within = dist2(pcx,pcy,c.x,c.y) < (lr+30)*(lr+30);
+      p.lit = within || p.bloom>0;
+    } else p.lit = true;
+  });
+
+  // ---- collisions (X then Y)
+  pl.x += pl.vx*dt;
+  for (const p of level.plats){ if (!solidNow(p)) continue;
+    if (aabb(pl,p)){
+      // Skip if we're essentially standing on top of this platform. A platform moving UP
+      // overlaps our feet at the start of the frame (before the Y pass re-seats us); without
+      // this guard the horizontal pass mistakes that for a side hit and snaps us off the edge
+      // (holding right ejected the player left on Level 3's rising elevator).
+      if (pl.y + pl.h <= p.y + 8) continue;
+      if (pl.vx>0) pl.x = p.x - pl.w; else if (pl.vx<0) pl.x = p.x+p.w;
+      pl.vx = 0;
+    }
+  }
+  const wasGround = pl.onGround; pl.onGround=false;
+  pl.y += pl.vy*dt;
+  for (const p of level.plats){ if (!solidNow(p)) continue;
+    if (aabb(pl,p)){
+      if (pl.vy>0){ pl.y = p.y - pl.h; pl.onGround=true;
+        if (pl.vy>520){ cam.shake=Math.max(cam.shake,Math.min(8,pl.vy/130)); SFX.land();
+          burstParticles(pcx, pl.y+pl.h, 6, {col:'#caa', spd:120, life:0.4, r:2, grav:200}); }
+        pl.vy=0;
+        // ride moving platform
+        if (p.type==='move'){ if(p.vert){ pl.y = p.y - pl.h; } pl.x += (p._x - (p._px??p._x)); }
+      } else if (pl.vy<0){ pl.y = p.y+p.h; pl.vy=0; }
+    }
+  }
+  if (!wasGround && pl.onGround){ pl.sx=1.35; pl.sy=0.7; }
+  level.plats.forEach(p=>{ if(p.type==='move') p._px=p._x; });
+
+  // squash/stretch easing
+  pl.sx += (1-pl.sx)*Math.min(1, dt*12); pl.sy += (1-pl.sy)*Math.min(1, dt*12);
+  if (Math.abs(pl.vx)>30 && pl.onGround) pl.walk += dt*Math.abs(pl.vx)*0.02;
+
+  // ---- motes
+  level.motes.forEach(m=>{ if(m.taken) return;
+    if (dist2(pcx,pcy,m.x,m.y) < 34*34){
+      m.taken=true; pl.light=clamp(pl.light+m.v,0,LIGHT_MAX); SFX.collect(); motesCollected++;
+      burstParticles(m.x,m.y,18,{col:'#fff0c0', spd:160, life:0.7, r:2.5, add:true});
+    }
+  });
+  // ---- beacons (checkpoint + light source + partial refill)
+  level.beacons.forEach(b=>{
+    if (dist2(pcx,pcy,b.x,b.y) < 46*46 && !b.on) lightBeacon(b);
+  });
+  // ---- spikes / umbra / void
+  for (const s of (level.spikes||[])){ if (aabb(pl,s)){ killPlayer(); } }
+  let inUmbra=false;
+  for (const u of (level.umbra||[])){ if (aabb(pl,u)){ inUmbra=true; } }
+  if (inUmbra){ pl.light = clamp(pl.light - 16*dt, 0, LIGHT_MAX);
+    if (Math.random()<dt*20) spawn(pl.x+pl.w/2+(Math.random()-0.5)*30, pl.y+(Math.random()*30), {col:'#114', vx:0, vy:-30, life:0.6, r:3, add:false}); }
+  if (pl.y > level.bottom+200){ killPlayer(); }
+  if (pl.light<=0 && !pl._wasDark){ pl._wasDark=true; }
+  if (pl.light>6) pl._wasDark=false;
+
+  // ---- goal
+  if (aabb(pl, level.goal)){ reachGoal(); }
+
+  // ---- ambient floaters within light
+  if (Math.random()<dt*14){
+    const a=Math.random()*Math.PI*2, rr=Math.random()*lr*0.8;
+    spawn(pcx+Math.cos(a)*rr, pcy+Math.sin(a)*rr, {col:'#ffe9b0', vx:(Math.random()-0.5)*10, vy:-12-Math.random()*14, life:1.4+Math.random(), r:1+Math.random()*1.5, add:true});
+  }
+
+  updateParts(dt);
+  updateCam(dt);
+
+  // clear edge-trigger latches
+  for (const k in justPressed) justPressed[k]=false;
+}
+
+function solidNow(p){ return p.type==='light' ? p.lit : true; }
+function lightBeacon(b){
+  if (b.on) return; b.on=true; player.respawn={x:b.x-player.w/2, y:b.y-player.h-2};
+  player.light = clamp(player.light+26,0,LIGHT_MAX);
+  SFX.beacon(); burstParticles(b.x,b.y,24,{col:'#bfe0ff', spd:150, life:0.9, r:2.5, add:true});
+}
+function killPlayer(){
+  if (player.dead>0) return;
+  player.dead = 0.7; deaths++; cam.shake=10; SFX.hurt();
+  burstParticles(player.x+player.w/2, player.y+player.h/2, 22, {col:'#ff8a6a', spd:200, life:0.7, r:3, add:true, grav:300});
+}
+function reachGoal(){
+  if (state!=='play') return;
+  if (levelIndex < LEVELS.length-1){
+    state='transition'; transTimer=2.2; flash=0.5; SFX.win();
+    burstParticles(level.goal.x+32, level.goal.y+40, 40, {col:'#ffe9b0', spd:220, life:1.2, r:3, add:true});
+    setTimeout(()=>{ if(levelIndex<LEVELS.length-1){ loadLevel(levelIndex+1); transTimer=Math.max(transTimer,0.01);} }, 1100);
+  } else {
+    // final altar -> dawn
+    state='win'; flash=0.5; SFX.win();
+    setAmbientWin();
+    burstParticles(level.goal.x+40, level.goal.y+40, 80, {col:'#ffe9b0', spd:260, life:1.6, r:3.5, add:true});
+  }
+}
+function setAmbientWin(){ if(actx) setAmbient(66,'warm'); }
+
+function updateCam(dt){
+  const pl=player;
+  const tx = pl.x+pl.w/2 - VIEW_W/2;
+  const ty = pl.y+pl.h/2 - VIEW_H*0.56;
+  cam.x += (tx-cam.x)*Math.min(1, dt*6);
+  cam.y += (ty-cam.y)*Math.min(1, dt*5);
+  cam.x = clamp(cam.x, -120, level.worldW - VIEW_W + 120);
+  cam.y = clamp(cam.y, -600, level.bottom - VIEW_H + 120);
+  cam.shake = Math.max(0, cam.shake - dt*26);
+  if (flash>0) flash = Math.max(0, flash - dt*0.8);
+  if (state==='win') dawnAmount = Math.min(1, dawnAmount + dt*0.5);
+}
+
+/* ----------------------------- render ----------------------------------- */
+function render(){
+  ctx.clearRect(0,0,VIEW_W,VIEW_H);
+  if (state==='title'){ drawTitle(); return; }
+
+  const sk = level.sky;
+  drawSky(sk);
+
+  const shx = (Math.random()-0.5)*cam.shake, shy=(Math.random()-0.5)*cam.shake;
+  const camx = cam.x+shx, camy = cam.y+shy;
+
+  // parallax silhouettes
+  drawParallax(camx, camy, sk);
+
+  ctx.save();
+  ctx.translate(-Math.round(camx), -Math.round(camy));
+
+  // umbra zones (drawn dark, slightly visible)
+  for (const u of (level.umbra||[])){
+    ctx.fillStyle='rgba(4,6,20,0.55)';
+    ctx.fillRect(u.x,u.y,u.w,u.h);
+    // wisps
+    ctx.fillStyle='rgba(10,14,40,0.5)';
+    for(let i=0;i<6;i++){ const wx=u.x+((i*131+ (time*20))%u.w); ctx.beginPath(); ctx.arc(wx, u.y+ (i*53%u.h), 26,0,7); ctx.fill(); }
+  }
+
+  // spikes
+  ctx.fillStyle='#0a0c18';
+  for (const s of (level.spikes||[])){
+    const n=Math.floor(s.w/18);
+    for(let i=0;i<n;i++){ const x=s.x+i*18; ctx.beginPath(); ctx.moveTo(x,s.y+s.h); ctx.lineTo(x+9,s.y-8); ctx.lineTo(x+18,s.y+s.h); ctx.closePath(); ctx.fill(); }
+    ctx.strokeStyle='rgba(120,150,210,0.25)'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+
+  // platforms
+  for (const p of level.plats) drawPlatform(p);
+
+  // beacons
+  for (const b of level.beacons) drawBeacon(b);
+
+  // motes
+  for (const m of level.motes){ if(m.taken) continue; drawMote(m); }
+
+  // goal
+  drawGoal(level.goal);
+
+  // particles (world)
+  drawParticles();
+
+  // player
+  if (!(player.dead>0 && Math.floor(player.dead*20)%2===0)) drawPlayer();
+
+  ctx.restore();
+
+  // ---- LIGHTING PASS ----
+  lightingPass(camx, camy);
+
+  // ---- additive bloom for light sources (warmth) ----
+  bloomPass(camx, camy);
+
+  // dormant light-platform hints (drawn above darkness so puzzles are fair)
+  drawLightHints(camx, camy);
+
+  // color grade + vignette
+  grade();
+
+  // dawn flood (final)
+  if (dawnAmount>0) dawnFlood();
+
+  if (flash>0){ ctx.fillStyle=`rgba(255,245,225,${flash})`; ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+
+  // HUD + overlays
+  drawHUD();
+  if (state==='play') drawTouchControls();
+  if (state==='transition') drawLevelCard();
+  if (state==='pause') drawPause();
+  if (state==='win') drawWin();
+}
+
+function drawSky(sk){
+  const g = ctx.createLinearGradient(0,0,0,VIEW_H);
+  const t = state==='win'? dawnAmount : 0;
+  g.addColorStop(0, mix(sk[0], '#5a3470', t));   // top → warm violet
+  g.addColorStop(0.45, mix(sk[1], '#bf5a44', t));// → rose
+  g.addColorStop(0.78, mix(sk[2], '#f0944e', t));// → amber
+  g.addColorStop(1, mix(sk[3], '#ffcf7a', t));   // → gold horizon
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  // sun/horizon glow
+  const sx=VIEW_W*0.5, sy=VIEW_H*(0.92 - 0.5*(state==='win'?dawnAmount:0));
+  const rg=ctx.createRadialGradient(sx,sy,10,sx,sy,520);
+  rg.addColorStop(0,`rgba(255,225,160,${0.45+0.22*(state==='win'?dawnAmount:0)})`);
+  rg.addColorStop(1,'rgba(255,200,120,0)');
+  ctx.fillStyle=rg; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  // stars in the dark upper sky for night levels
+  if (level.dark>0.8){
+    ctx.fillStyle='rgba(220,225,255,0.5)';
+    for(let i=0;i<70;i++){ const x=(i*137.5)%VIEW_W, y=(i*89.3)%(VIEW_H*0.55); const tw=0.5+0.5*Math.sin(time*2+i); ctx.globalAlpha=0.2+0.5*tw*(1-(state==='win'?dawnAmount:0)); ctx.fillRect(x,y,1.6,1.6);} ctx.globalAlpha=1;
+  }
+}
+function drawParallax(camx,camy,sk){
+  // distant ridgelines
+  const layers=[{c:mix(sk[1],'#000',0.55),s:0.18,h:0.74,a:0.7},{c:mix(sk[2],'#000',0.6),s:0.34,h:0.82,a:0.8},{c:'#0a0a16',s:0.55,h:0.9,a:1}];
+  layers.forEach((L,li)=>{
+    ctx.fillStyle=L.c; ctx.globalAlpha=L.a;
+    ctx.beginPath(); ctx.moveTo(0,VIEW_H);
+    const base=VIEW_H*L.h - camy*L.s*0.3;
+    for(let x=0;x<=VIEW_W;x+=40){
+      const wx=x+camx*L.s;
+      const y=base + Math.sin(wx*0.002+li)*40 + Math.sin(wx*0.006+li*2)*18;
+      ctx.lineTo(x,y);
+    }
+    ctx.lineTo(VIEW_W,VIEW_H); ctx.closePath(); ctx.fill();
+  });
+  ctx.globalAlpha=1;
+}
+function drawPlatform(p){
+  if (p.type==='light'){
+    const a = p.lit? 1 : 0; // visible solid only when lit; hint drawn later
+    if (a>0){
+      roundRect(p.x,p.y,p.w,p.h,7);
+      const g=ctx.createLinearGradient(0,p.y,0,p.y+p.h);
+      g.addColorStop(0,'rgba(255,236,180,0.95)'); g.addColorStop(1,'rgba(255,196,120,0.85)');
+      ctx.fillStyle=g; ctx.fill();
+      ctx.strokeStyle='rgba(255,250,230,0.9)'; ctx.lineWidth=2; ctx.stroke();
+    }
+    return;
+  }
+  // solid / move : readable landform with a bright top surface
+  roundRect(p.x,p.y,p.w,p.h, p.type==='move'?8:6);
+  const g=ctx.createLinearGradient(0,p.y,0,p.y+Math.min(p.h,150));
+  g.addColorStop(0, p.type==='move'?'#3c3768':'#2c3354'); g.addColorStop(1, p.type==='move'?'#171430':'#10142a');
+  ctx.fillStyle=g; ctx.fill();
+  // bright top edge so ground always reads as solid
+  ctx.fillStyle = p.type==='move'? 'rgba(205,190,255,0.9)':'rgba(160,178,228,0.75)';
+  ctx.fillRect(p.x+3,p.y, p.w-6, 3);
+  if (p.type==='move'){ ctx.strokeStyle='rgba(190,170,255,0.55)'; ctx.lineWidth=1.5; ctx.stroke(); }
+}
+function drawLightHints(camx,camy){
+  ctx.save(); ctx.translate(-Math.round(camx),-Math.round(camy));
+  for (const p of level.plats){ if (p.type!=='light'||p.lit) continue;
+    ctx.globalAlpha = 0.32+0.18*Math.sin(time*2.5);
+    ctx.strokeStyle='rgba(255,225,170,0.8)'; ctx.lineWidth=1.4; ctx.setLineDash([6,6]);
+    roundRect(p.x,p.y,p.w,p.h,7); ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.globalAlpha=1; ctx.restore();
+}
+function drawBeacon(b){
+  // base column
+  ctx.fillStyle='#0b0d1a';
+  roundRect(b.x-7,b.y-46,14,52,4); ctx.fill();
+  const r = b.on? 22:13;
+  const g=ctx.createRadialGradient(b.x,b.y-48,2,b.x,b.y-48,r*2.4);
+  g.addColorStop(0, b.on?'rgba(190,225,255,0.95)':'rgba(150,180,230,0.5)');
+  g.addColorStop(1,'rgba(120,170,255,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(b.x,b.y-48,r*2.4,0,7); ctx.fill();
+  ctx.fillStyle = b.on?'#dff0ff':'#9fb6dd'; ctx.beginPath(); ctx.arc(b.x,b.y-48,b.on?6:4,0,7); ctx.fill();
+}
+function drawMote(m){
+  const pulse = 1+0.18*Math.sin(time*4+m.x);
+  const g=ctx.createRadialGradient(m.x,m.y,1,m.x,m.y,26*pulse);
+  g.addColorStop(0,'rgba(255,244,200,0.98)'); g.addColorStop(0.5,'rgba(255,210,130,0.55)'); g.addColorStop(1,'rgba(255,190,90,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(m.x,m.y,26*pulse,0,7); ctx.fill();
+  ctx.fillStyle='#fff6da'; ctx.beginPath(); ctx.arc(m.x,m.y,3.4,0,7); ctx.fill();
+}
+function drawGoal(go){
+  const cx=go.x+go.w/2, cy=go.y+go.h/2;
+  // altar arch
+  ctx.strokeStyle='rgba(255,228,170,0.85)'; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.moveTo(go.x,go.y+go.h); ctx.lineTo(go.x,go.y+24);
+  ctx.quadraticCurveTo(cx,go.y-22, go.x+go.w, go.y+24); ctx.lineTo(go.x+go.w,go.y+go.h); ctx.stroke();
+  const pulse=0.6+0.4*Math.sin(time*3);
+  const g=ctx.createRadialGradient(cx,cy,4,cx,cy,90);
+  g.addColorStop(0,`rgba(255,236,180,${0.5*pulse})`); g.addColorStop(1,'rgba(255,210,130,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,90,0,7); ctx.fill();
+  ctx.fillStyle='rgba(255,246,214,0.9)'; ctx.beginPath(); ctx.arc(cx, go.y+18, 7,0,7); ctx.fill();
+  // floating label so the goal is unmistakable
+  ctx.save(); ctx.textAlign='center';
+  ctx.fillStyle=`rgba(255,236,180,${0.7+0.3*Math.sin(time*3)})`; ctx.font='600 16px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('the dawn gate', cx, go.y-18); ctx.restore();
+}
+function drawPlayer(){
+  const pl=player; const cx=pl.x+pl.w/2, cy=pl.y+pl.h/2;
+  ctx.save(); ctx.translate(cx,cy); ctx.scale(pl.sx, pl.sy);
+  // body silhouette (a small cloaked wanderer carrying light)
+  ctx.fillStyle='#0a0a14';
+  roundRectAt(-pl.w/2, -pl.h/2, pl.w, pl.h, 7); ctx.fill();
+  // glowing core in chest
+  const cg=ctx.createRadialGradient(0,-2,1,0,-2,16);
+  cg.addColorStop(0,'rgba(255,247,220,1)'); cg.addColorStop(0.6,'rgba(255,210,130,0.8)'); cg.addColorStop(1,'rgba(255,190,90,0)');
+  ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(0,-2,16,0,7); ctx.fill();
+  ctx.fillStyle='#fff7dc'; ctx.beginPath(); ctx.arc(0,-2,4.2,0,7); ctx.fill();
+  ctx.restore();
+}
+function drawParticles(){
+  for (const p of parts){
+    const a = p.fade!==false ? clamp(p.life/p.max,0,1) : 1;
+    if (p.ring){
+      ctx.strokeStyle=`rgba(255,230,168,${a*0.8})`; ctx.lineWidth=3;
+      const rr = lerp(8, PULSE_R, 1-p.life/p.max);
+      ctx.beginPath(); ctx.arc(p.x,p.y,rr,0,7); ctx.stroke(); continue;
+    }
+    if (p.add) ctx.globalCompositeOperation='lighter';
+    ctx.fillStyle = colWithA(p.col, a);
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+    ctx.globalCompositeOperation='source-over';
+  }
+}
+
+/* lighting: darkness overlay with holes punched at each light source */
+function lightingPass(camx,camy){
+  const pl=player;
+  lctx.clearRect(0,0,VIEW_W,VIEW_H);
+  // darkness
+  const d = level.dark * (1 - (state==='win'?dawnAmount:0)*0.72);
+  lctx.fillStyle=`rgba(3,4,14,${d})`;
+  lctx.fillRect(0,0,VIEW_W,VIEW_H);
+  lctx.globalCompositeOperation='destination-out';
+  const punch=(wx,wy,r,soft=0.55)=>{
+    const x=wx-camx, y=wy-camy;
+    const g=lctx.createRadialGradient(x,y,r*soft*0.2,x,y,r);
+    g.addColorStop(0,'rgba(0,0,0,1)'); g.addColorStop(soft,'rgba(0,0,0,0.85)'); g.addColorStop(1,'rgba(0,0,0,0)');
+    lctx.fillStyle=g; lctx.beginPath(); lctx.arc(x,y,r,0,7); lctx.fill();
+  };
+  const lr = lerp(R_MIN,R_MAX, pl.light/LIGHT_MAX) * (1+0.03*Math.sin(time*6));
+  punch(pl.x+pl.w/2, pl.y+pl.h/2, lr, 0.5);
+  level.motes.forEach(m=>{ if(!m.taken) punch(m.x,m.y, 95, 0.45); });
+  level.beacons.forEach(b=>{ if(b.on) punch(b.x,b.y-48, 150, 0.5); else punch(b.x,b.y-48,70,0.5); });
+  level.plats.forEach(p=>{ if(p.type==='light'&&p.lit){ const c=rectCenter(p); punch(c.x,c.y,70,0.5);} });
+  const go=level.goal; punch(go.x+go.w/2, go.y+go.h/2, 120,0.5);
+  lctx.globalCompositeOperation='source-over';
+  ctx.drawImage(lc,0,0);
+}
+function bloomPass(camx,camy){
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  const pl=player; const lr=lerp(R_MIN,R_MAX, pl.light/LIGHT_MAX);
+  const warm=(wx,wy,r,c,a)=>{ const x=wx-camx,y=wy-camy; const g=ctx.createRadialGradient(x,y,1,x,y,r); g.addColorStop(0,colWithA(c,a)); g.addColorStop(1,colWithA(c,0)); ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); };
+  warm(pl.x+pl.w/2, pl.y+pl.h/2, lr*0.85, '#ffcf86', 0.20);
+  level.motes.forEach(m=>{ if(!m.taken) warm(m.x,m.y,70,'#ffd98f',0.22); });
+  level.beacons.forEach(b=>{ if(b.on) warm(b.x,b.y-48,120,'#a9d4ff',0.20); });
+  ctx.restore();
+}
+function grade(){
+  // level tint
+  ctx.save(); ctx.globalCompositeOperation='overlay';
+  ctx.fillStyle=level.tint; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  ctx.restore();
+  // vignette
+  const g=ctx.createRadialGradient(VIEW_W/2,VIEW_H/2, VIEW_H*0.35, VIEW_W/2,VIEW_H/2, VIEW_H*0.85);
+  g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,5,0.32)');
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+}
+function dawnFlood(){
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  const g=ctx.createRadialGradient(VIEW_W/2,VIEW_H*0.6,10,VIEW_W/2,VIEW_H*0.6,VIEW_W*0.8);
+  g.addColorStop(0,`rgba(255,238,196,${0.28*dawnAmount})`); g.addColorStop(1,'rgba(255,220,150,0)');
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  ctx.restore();
+}
+
+/* ----------------------------- HUD / UI --------------------------------- */
+function drawHUD(){
+  const pl=player; if(!pl) return;
+  if (state==='win') return; // win screen draws clean — no meter/objective/tips
+  const frac=clamp(pl.light/LIGHT_MAX,0,1);
+  const col = frac>0.5?'#ffd98f': frac>0.22?'#ffae5e':'#ff7a6a';
+
+  // ---- light meter (top-left) with label ----
+  const x=48, y=50, R=26;
+  ctx.save();
+  ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.lineWidth=7; ctx.beginPath(); ctx.arc(x,y,R,0,7); ctx.stroke();
+  ctx.strokeStyle=col; ctx.lineWidth=7; ctx.lineCap='round'; ctx.beginPath(); ctx.arc(x,y,R,-Math.PI/2, -Math.PI/2 + frac*Math.PI*2); ctx.stroke(); ctx.lineCap='butt';
+  const cg=ctx.createRadialGradient(x,y,1,x,y,R*0.85); cg.addColorStop(0,colWithA(col,0.95)); cg.addColorStop(1,colWithA(col,0));
+  ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(x,y,R*0.85,0,7); ctx.fill();
+  ctx.fillStyle='#fff7dc'; ctx.beginPath(); ctx.arc(x,y,5*(0.55+0.45*frac),0,7); ctx.fill();
+  ctx.textAlign='left';
+  ctx.fillStyle='rgba(255,240,210,0.96)'; ctx.font='700 14px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('LIGHT', x+R+18, y-5);
+  ctx.fillStyle='rgba(200,206,226,0.72)'; ctx.font='400 12px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText(level.name + ' — ' + level.sub, x+R+18, y+13);
+  ctx.restore();
+
+  // ---- objective + off-screen goal arrow (top center) ----
+  const gc=rectCenter(level.goal);
+  ctx.save(); ctx.textAlign='center';
+  ctx.fillStyle='rgba(255,236,190,0.9)'; ctx.font='600 15px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('Objective: reach the dawn gate', VIEW_W/2, 34);
+  const sgx=gc.x-cam.x, sgy=gc.y-cam.y;
+  if (sgx>VIEW_W-44 || sgx<44 || sgy<60 || sgy>VIEW_H-44){
+    const ax=clamp(sgx,54,VIEW_W-54), ay=clamp(sgy,64,VIEW_H-54);
+    ctx.translate(ax,ay); ctx.rotate(Math.atan2(sgy-ay, sgx-ax));
+    ctx.fillStyle=`rgba(255,224,150,${0.55+0.45*Math.sin(time*4)})`;
+    ctx.beginPath(); ctx.moveTo(15,0); ctx.lineTo(-9,-10); ctx.lineTo(-9,10); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+
+  // ---- low-light warning ----
+  if (frac<=0.22){ ctx.save(); ctx.globalAlpha=0.5+0.5*Math.sin(time*8); ctx.fillStyle='#ff7a6a'; ctx.textAlign='center';
+    ctx.font='600 17px ui-sans-serif,system-ui,sans-serif'; ctx.fillText('Your light is dying — find a mote!', VIEW_W/2, 58); ctx.restore(); }
+
+  // ---- contextual prompt near an unlit light-platform ----
+  const pcx=pl.x+pl.w/2, pcy=pl.y+pl.h/2; let prompt=null;
+  for (const p of level.plats){ if(p.type==='light' && !p.lit){ const c=rectCenter(p); if(dist2(pcx,pcy,c.x,c.y) < 165*165){ prompt='Press  J  — Sunburst to make the pale platforms solid'; break; } } }
+  if (prompt){ ctx.save(); ctx.textAlign='center'; ctx.font='600 16px ui-sans-serif,system-ui,sans-serif';
+    const w=ctx.measureText(prompt).width+36; ctx.fillStyle='rgba(8,8,20,0.66)'; roundRect(VIEW_W/2-w/2, VIEW_H-118, w, 36, 9); ctx.fill();
+    ctx.fillStyle='rgba(255,233,176,0.97)'; ctx.fillText(prompt, VIEW_W/2, VIEW_H-94); ctx.restore(); }
+
+  // ---- brief control hint up top (auto-hides after a few seconds; never overlaps the buttons) ----
+  if (levelTime < 7){ ctx.save(); ctx.globalAlpha=clamp(7-levelTime,0,1)*0.85; ctx.textAlign='center';
+    ctx.font='500 14px ui-sans-serif,system-ui,sans-serif'; ctx.fillStyle='rgba(223,227,242,0.95)';
+    ctx.fillText('← →  or  A D  move      SPACE / W  jump      J  sunburst', VIEW_W/2, 56);
+    ctx.restore(); }
+
+  // ---- in-world teaching tips: one readable panel at a time ----
+  if (level.tips){
+    let active=null, bestd=1e9;
+    for (const tp of level.tips){ const d=Math.abs(pl.x-tp.x); if(d<320 && d<bestd){ bestd=d; active=tp; } }
+    if (active){ const a=clamp(1-(bestd-190)/130,0,1);
+      if(a>0.01){ ctx.save(); ctx.globalAlpha=a; ctx.textAlign='center'; ctx.font='500 18px ui-sans-serif,system-ui,sans-serif';
+        const lines=wrapLines(active.t, 600); const lh=26; const pw=640, ph=lines.length*lh+26, py=VIEW_H*0.15;
+        ctx.fillStyle='rgba(8,8,20,0.7)'; roundRect(VIEW_W/2-pw/2, py, pw, ph, 12); ctx.fill();
+        ctx.strokeStyle='rgba(255,224,170,0.22)'; ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle='rgba(245,238,222,0.97)';
+        lines.forEach((ln,i)=> ctx.fillText(ln, VIEW_W/2, py+30+i*lh));
+        ctx.restore();
+      }
+    }
+  }
+}
+function drawTouchControls(){
+  const b=ctrlButtons();
+  ctx.save();
+  const draw=(r,active,kind)=>{
+    ctx.fillStyle=`rgba(255,255,255,${active?0.24:0.10})`; roundRect(r.x,r.y,r.w,r.h,14); ctx.fill();
+    ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='rgba(255,247,224,0.85)';
+    const cx=r.x+r.w/2, cy=r.y+r.h/2;
+    if (kind==='left'){ ctx.beginPath(); ctx.moveTo(cx+8,cy-12); ctx.lineTo(cx-9,cy); ctx.lineTo(cx+8,cy+12); ctx.closePath(); ctx.fill(); }
+    else if (kind==='right'){ ctx.beginPath(); ctx.moveTo(cx-8,cy-12); ctx.lineTo(cx+9,cy); ctx.lineTo(cx-8,cy+12); ctx.closePath(); ctx.fill(); }
+    else { ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.font=`700 ${kind==='jump'?15:12}px ui-sans-serif,system-ui,sans-serif`; ctx.fillText(r.label,cx,cy+1); ctx.textBaseline='alphabetic'; }
+  };
+  draw(b.left,touch.left,'left'); draw(b.right,touch.right,'right'); draw(b.jump,touch.jump,'jump'); draw(b.burst,touch.pulse,'burst');
+  ctx.restore();
+}
+function drawLevelCard(){
+  const a=clamp(transTimer/2.2,0,1);
+  ctx.fillStyle=`rgba(4,5,14,${0.55*Math.min(1,a*2)})`; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  ctx.textAlign='center';
+  ctx.globalAlpha=Math.min(1,a*1.6);
+  ctx.fillStyle='#ffe9b0'; ctx.font='700 46px Georgia, "Times New Roman", serif';
+  ctx.fillText(level.name, VIEW_W/2, VIEW_H/2-6);
+  ctx.fillStyle='rgba(230,224,205,0.85)'; ctx.font='300 18px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText(level.sub, VIEW_W/2, VIEW_H/2+30);
+  ctx.globalAlpha=1;
+}
+function drawPause(){
+  ctx.fillStyle='rgba(4,5,14,0.6)'; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  ctx.textAlign='center'; ctx.fillStyle='#f4ecd8'; ctx.font='700 40px Georgia,serif';
+  ctx.fillText('Paused', VIEW_W/2, VIEW_H/2-10);
+  ctx.fillStyle='rgba(200,205,225,0.8)'; ctx.font='400 16px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('P / Esc to resume · R restart level · M ' + (muted?'unmute':'mute'), VIEW_W/2, VIEW_H/2+26);
+}
+function drawWin(){
+  const a=clamp((dawnAmount-0.15)/0.6,0,1);
+  ctx.save(); ctx.globalAlpha=a; ctx.textAlign='center';
+  ctx.shadowColor='rgba(50,28,10,0.45)'; ctx.shadowBlur=22; ctx.shadowOffsetY=2;
+  ctx.fillStyle='#fff6e4'; ctx.font='700 58px Georgia, "Times New Roman", serif';
+  ctx.fillText('Dawn breaks.', VIEW_W/2, VIEW_H*0.40);
+  ctx.font='300 23px ui-sans-serif,system-ui,sans-serif'; ctx.fillStyle='rgba(255,247,230,0.96)';
+  ctx.fillText('The longest day begins.', VIEW_W/2, VIEW_H*0.40+46);
+  ctx.shadowBlur=12;
+  ctx.font='400 16px ui-sans-serif,system-ui,sans-serif'; ctx.fillStyle='rgba(255,244,224,0.92)';
+  const mm=Math.floor(time/60), ss=Math.floor(time%60).toString().padStart(2,'0');
+  ctx.fillText(`You carried the light through the dark in ${mm}:${ss}   ·   ${deaths} ${deaths===1?'fall':'falls'}`, VIEW_W/2, VIEW_H*0.40+84);
+  ctx.font='600 16px ui-sans-serif,system-ui,sans-serif'; ctx.fillStyle='rgba(255,244,224,0.9)';
+  ctx.fillText('Press  ENTER  to greet the sun again', VIEW_W/2, VIEW_H*0.74);
+  ctx.restore();
+}
+function drawTitle(){
+  // sky
+  const g=ctx.createLinearGradient(0,0,0,VIEW_H);
+  g.addColorStop(0,'#120c28'); g.addColorStop(0.5,'#3a2150'); g.addColorStop(0.8,'#9c4a44'); g.addColorStop(1,'#f0b86a');
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  // sun low on the horizon
+  const sx=VIEW_W/2, sy=VIEW_H*0.92;
+  const rg=ctx.createRadialGradient(sx,sy,8,sx,sy,380);
+  rg.addColorStop(0,'rgba(255,228,160,0.95)'); rg.addColorStop(0.4,'rgba(255,180,110,0.45)'); rg.addColorStop(1,'rgba(255,160,90,0)');
+  ctx.fillStyle=rg; ctx.beginPath(); ctx.arc(sx,sy,380,0,7); ctx.fill();
+  drawParallax(0,0,['#150f2e','#3a2150','#7d3550','#000']);
+  for (let i=0;i<22;i++){ const x=(i*173+Math.sin(titleT*0.5+i)*40)%VIEW_W; const y=(i*97+titleT*15)%(VIEW_H*0.6); const a=0.12+0.22*Math.sin(titleT*2+i);
+    ctx.globalCompositeOperation='lighter'; ctx.fillStyle=`rgba(255,224,160,${a})`; ctx.beginPath(); ctx.arc(x,y,2,0,7); ctx.fill(); ctx.globalCompositeOperation='source-over'; }
+
+  // title
+  ctx.textAlign='center';
+  ctx.fillStyle='rgba(255,247,224,0.98)'; ctx.font='700 74px Georgia, "Times New Roman", serif';
+  ctx.shadowColor='rgba(0,0,0,0.5)'; ctx.shadowBlur=22;
+  ctx.fillText('SOLSTICE', VIEW_W/2, 128);
+  ctx.shadowBlur=0;
+  ctx.fillStyle='rgba(244,236,216,0.9)'; ctx.font='300 19px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('The Longest Day  ·  a game of light and dark', VIEW_W/2, 162);
+
+  // how-to-play card
+  const bx=VIEW_W/2-310, by=196, bw=620, bh=292;
+  ctx.fillStyle='rgba(8,8,20,0.66)'; roundRect(bx,by,bw,bh,16); ctx.fill();
+  ctx.strokeStyle='rgba(255,224,170,0.28)'; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.textAlign='left';
+  ctx.fillStyle='rgba(255,228,170,0.95)'; ctx.font='700 17px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('HOW TO PLAY', bx+30, by+40);
+  const rows=[
+    'Your light is your life — it slowly fades. Don’t let it go out.',
+    'Touch glowing motes to refill your light.',
+    'Pale platforms turn solid only inside your light.',
+    'Press J for a Sunburst to light platforms from a distance.',
+    'Reach the glowing gate to bring back the dawn.',
+  ];
+  rows.forEach((line,i)=>{ const y=by+76+i*34;
+    ctx.fillStyle='rgba(255,200,120,0.95)'; ctx.beginPath(); ctx.arc(bx+36, y-5, 3.5, 0, 7); ctx.fill();
+    ctx.fillStyle='rgba(238,232,214,0.94)'; ctx.font='400 16px ui-sans-serif,system-ui,sans-serif'; ctx.fillText(line, bx+52, y);
+  });
+  ctx.textAlign='center'; ctx.fillStyle='rgba(200,206,226,0.85)'; ctx.font='500 14px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('move  ← → / A D       jump  SPACE / W       sunburst  J / Shift       pause  P       mute  M', VIEW_W/2, by+bh-18);
+
+  // prompt
+  ctx.globalAlpha=0.55+0.45*Math.sin(titleT*3);
+  ctx.fillStyle='#fff'; ctx.font='600 20px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('Click the game, then press  ENTER  to begin', VIEW_W/2, by+bh+52);
+  ctx.globalAlpha=1;
+  ctx.fillStyle='rgba(220,224,240,0.55)'; ctx.font='400 12px ui-sans-serif,system-ui,sans-serif';
+  ctx.fillText('If the keys don’t respond, click the game once to focus it — or use the on-screen buttons.', VIEW_W/2, by+bh+78);
+}
+
+/* ----------------------------- drawing utils ---------------------------- */
+function roundRect(x,y,w,h,r){ ctx.beginPath(); r=Math.min(r,w/2,h/2);
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function roundRectAt(x,y,w,h,r){ roundRect(x,y,w,h,r); }
+function roundRectAtCtx(x,y,w,h,r){ roundRect(x,y,w,h,r); ctx.fill(); }
+function wrapText(text,cx,y,maxW,lh){ const words=text.split(' '); let line=''; const lines=[];
+  for(const w of words){ const t=line?line+' '+w:w; if(ctx.measureText(t).width>maxW && line){ lines.push(line); line=w; } else line=t; }
+  if(line) lines.push(line);
+  lines.forEach((ln,i)=> ctx.fillText(ln,cx,y+i*lh)); }
+function wrapLines(text,maxW){ const words=text.split(' '); let line=''; const lines=[];
+  for(const w of words){ const t=line?line+' '+w:w; if(ctx.measureText(t).width>maxW && line){ lines.push(line); line=w; } else line=t; }
+  if(line) lines.push(line); return lines; }
+function mix(a,b,t){ const A=hex(a),B=hex(b); return `rgb(${Math.round(lerp(A[0],B[0],t))},${Math.round(lerp(A[1],B[1],t))},${Math.round(lerp(A[2],B[2],t))})`; }
+function hex(h){ if(h[0]!=='#') return [40,40,60]; const n=parseInt(h.slice(1),16); return h.length>=7?[(n>>16)&255,(n>>8)&255,n&255]:[((n>>8)&15)*17,((n>>4)&15)*17,(n&15)*17]; }
+function colWithA(c,a){ if(c.startsWith('#')){ const [r,g,b]=hex(c); return `rgba(${r},${g},${b},${a})`; }
+  if(c.startsWith('rgba')) return c.replace(/[\d.]+\)$/,a+')'); if(c.startsWith('rgb(')) return c.replace('rgb(','rgba(').replace(')',`,${a})`); return c; }
+
+/* ----------------------------- menu / flow ------------------------------ */
+function startGame(){ ensureAudio(); loadLevel(0); state='transition'; transTimer=2.0;
+  try{ cv.focus(); }catch(e){}
+  if(actx) setAmbient(55,'warm'); }
+function handleMenuKey(k){
+  if (state==='title' && (k==='enter'||k===' ')) startGame();
+  else if (state==='win' && (k==='enter')) { time=0; deaths=0; state='title'; }
+  else if (k==='p'||k==='escape'){ if(state==='play') state='pause'; else if(state==='pause') state='play'; }
+  else if (k==='r' && (state==='play'||state==='pause')){ loadLevel(levelIndex); state='play'; }
+  else if (k==='m'){ muted=!muted; if(master) master.gain.value = muted?0:0.9; }
+}
+function menuClick(){ if (state==='title') startGame(); else if(state==='win'){ time=0; deaths=0; state='title'; } }
+
+/* ----------------------------- main loop -------------------------------- */
+let last=performance.now(), acc=0; const STEP=1/120;
+function frame(now){
+  let dt=(now-last)/1000; last=now; if (dt>0.05) dt=0.05;
+  acc+=dt;
+  while (acc>=STEP){ update(STEP); acc-=STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+try{ cv.focus(); }catch(e){}
+addEventListener('load', ()=>{ try{ cv.focus(); }catch(e){} });
+
+// optional attract / auto-play mode — only for headless verification & demo capture; never triggered in normal play
+const AUTO = /auto/i.test((typeof location!=='undefined' && location.hash)||'') || (typeof window!=='undefined' && !!window.__AUTO);
+let autoT=0, autoJump=0;
+function autoDrive(dt){
+  autoT+=dt; const pl=player; if(!pl) return;
+  keys['arrowleft']=false; keys['arrowright']=true;
+  const footY = pl.y+pl.h, aheadX = pl.x+pl.w+40;
+  let groundAhead=false, wallAhead=false;
+  for(const p of level.plats){ if(!solidNow(p)) continue;
+    if (aheadX>p.x-6 && aheadX<p.x+p.w+6 && p.y>=footY-14 && p.y<footY+120) groundAhead=true;
+    if (p.x>pl.x+pl.w-4 && p.x<pl.x+pl.w+32 && p.y<pl.y+pl.h-2 && p.y+p.h>pl.y+4) wallAhead=true;
+  }
+  // pulse to bloom unlit light-platforms just ahead (keeps the path solid as we approach)
+  let needPulse=false;
+  for(const p of level.plats){ if(p.type==='light' && !p.lit){ const c=rectCenter(p); if(c.x>pl.x-20 && c.x<pl.x+280 && c.y>pl.y-90 && c.y<pl.y+240){ needPulse=true; break; } } }
+  if (needPulse && pl.pulseCd<=0 && pl.light>=PULSE_COST) justPressed['j']=true;
+  // jump WITH A HOLD for full height (releasing immediately would trigger the jump-cut and undershoot)
+  const wantJump = pl.onGround && (!groundAhead || wallAhead);
+  if (wantJump && autoJump<=0){ justPressed[' ']=true; autoJump=0.28; }
+  if (autoJump>0){ autoJump-=dt; keys[' ']=true; } else keys[' ']=false;
+}
+if (AUTO){ addEventListener('load', ()=>{ ensureAudio(); startGame(); }); }
+
+// expose a tiny hook for automated demo capture / debugging
+window.__solstice = {
+  state:()=>state, level:()=>levelIndex, light:()=>player&&player.light,
+  x:()=>player&&player.x, y:()=>player&&player.y, onGround:()=>player&&player.onGround,
+  press:(k)=>{ keys[k]=true; justPressed[k]=true; }, release:(k)=>{ keys[k]=false; },
+  start:startGame, load:(i)=>{ loadLevel(i); state='play'; }, set:(o)=>Object.assign(player,o),
+  win:()=>{ loadLevel(LEVELS.length-1); state='play'; reachGoal(); }
+};
+})();
+</script>
+</body>
+</html>
